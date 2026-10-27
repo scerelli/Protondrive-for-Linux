@@ -3,6 +3,8 @@
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Session bridge now accepts Proton Drive CLI 0.6.x-0.9.x (validated against 0.9.0). Export writes the 0.6.x+ session layout (no `cachePassword`, keeps `telemetryEnabled`) when that CLI is installed. Fixes #15.
 
 ## [0.3.0] - 2026-07-14
 ### Added

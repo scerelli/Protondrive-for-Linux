@@ -314,20 +314,83 @@ func TestParseProtonCLIAssets(t *testing.T) {
 }
 
 func TestValidateProtonSessionBridgeVersionOutput(t *testing.T) {
-	accepted := []string{
-		"Proton Drive CLI cli-drive@0.4.6\nProton Drive SDK js@0.14.10",
-		"Proton Drive CLI cli-drive@0.5.0+73e40d90\nProton Drive SDK js@0.19.1+73e40d90",
+	accepted := map[string]protonSessionFormat{
+		"Proton Drive CLI cli-drive@0.4.6\nProton Drive SDK js@0.14.10":                  protonSessionFormatLegacy,
+		"Proton Drive CLI cli-drive@0.5.0+73e40d90\nProton Drive SDK js@0.19.1+73e40d90": protonSessionFormatLegacy,
+		"Proton Drive CLI 0.6.0": protonSessionFormatV2,
+		"Proton Drive CLI cli-drive@0.9.0+75612299\nProton Drive SDK js@0.22.2+75612299": protonSessionFormatV2,
 	}
-	for _, output := range accepted {
-		if err := validateProtonSessionBridgeVersionOutput(output); err != nil {
+	for output, want := range accepted {
+		got, err := validateProtonSessionBridgeVersionOutput(output)
+		if err != nil {
 			t.Fatalf("expected %q to be accepted: %v", output, err)
 		}
+		if got != want {
+			t.Fatalf("format for %q = %v, want %v", output, got, want)
+		}
 	}
-	for _, output := range []string{"Proton Drive CLI 0.6.0", "Proton Drive CLI 1.0.0", "unknown"} {
-		if err := validateProtonSessionBridgeVersionOutput(output); err == nil {
+	for _, output := range []string{"Proton Drive CLI 0.3.9", "Proton Drive CLI 0.10.0", "Proton Drive CLI 1.0.0", "unknown"} {
+		if _, err := validateProtonSessionBridgeVersionOutput(output); err == nil {
 			t.Fatalf("expected %q to be rejected", output)
 		}
 	}
+}
+
+func TestLoadProtonCLISessionSnapshotV2Format(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PROTON_DRIVE_UNSAFE_SECRETS", "true")
+	t.Setenv("PROTON_DRIVE_CACHE_DIR", dir)
+	payload := `{"userKeyPassword":"ukp","session":{"uid":"uid-1","accessToken":"at","refreshToken":"rt"},"telemetryEnabled":false}`
+	if err := os.WriteFile(filepath.Join(dir, "auth-session.json"), []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := loadProtonCLISessionSnapshot()
+	if err != nil {
+		t.Fatalf("loadProtonCLISessionSnapshot returned error: %v", err)
+	}
+	if snapshot.UserKeyPassword != "ukp" || snapshot.Session.UID != "uid-1" || snapshot.Session.AccessToken != "at" || snapshot.Session.RefreshToken != "rt" {
+		t.Fatalf("unexpected snapshot: %#v", snapshot)
+	}
+	if snapshot.TelemetryEnabled == nil || *snapshot.TelemetryEnabled {
+		t.Fatalf("telemetryEnabled not parsed as false: %#v", snapshot.TelemetryEnabled)
+	}
+}
+
+func TestAdaptProtonCLISessionSnapshot(t *testing.T) {
+	var base protonCLISessionSnapshot
+	base.CachePassword = "cache"
+	base.UserKeyPassword = "ukp"
+	base.Session.UID = "uid"
+	base.Session.AccessToken = "at"
+	base.Session.RefreshToken = "rt"
+
+	legacy := adaptProtonCLISessionSnapshot(base, protonSessionFormatLegacy, protonCLISessionStoreSnapshot{})
+	raw, _ := json.Marshal(legacy)
+	if !strings.Contains(string(raw), `"cachePassword":"cache"`) || strings.Contains(string(raw), "telemetryEnabled") {
+		t.Fatalf("legacy payload has wrong shape: %s", raw)
+	}
+
+	v2 := adaptProtonCLISessionSnapshot(base, protonSessionFormatV2, protonCLISessionStoreSnapshot{})
+	raw, _ = json.Marshal(v2)
+	if strings.Contains(string(raw), "cachePassword") || !strings.Contains(string(raw), `"telemetryEnabled":false`) {
+		t.Fatalf("v2 payload has wrong shape: %s", raw)
+	}
+
+	previous := protonCLISessionStoreSnapshot{Exists: true, Payload: []byte(`{"telemetryEnabled":true}`)}
+	kept := adaptProtonCLISessionSnapshot(base, protonSessionFormatV2, previous)
+	if kept.TelemetryEnabled == nil || !*kept.TelemetryEnabled {
+		t.Fatal("v2 export did not keep the previous telemetry choice")
+	}
+	if _, err := writeProtonCLISessionSnapshotForTest(t, kept); err != nil {
+		t.Fatalf("v2 snapshot without cachePassword was rejected: %v", err)
+	}
+}
+
+func writeProtonCLISessionSnapshotForTest(t *testing.T, snapshot protonCLISessionSnapshot) (string, error) {
+	t.Helper()
+	t.Setenv("PROTON_DRIVE_UNSAFE_SECRETS", "true")
+	t.Setenv("PROTON_DRIVE_CACHE_DIR", t.TempDir())
+	return writeProtonCLISessionSnapshot(snapshot)
 }
 
 func TestRclonePlatform(t *testing.T) {

@@ -57,15 +57,28 @@ func configureRemote(remote, email, password, mailboxPassword string, quiet bool
 	return nil
 }
 
+// protonCLISessionSnapshot mirrors the session JSON the official CLI keeps in
+// the OS secret store. CLI 0.4.x/0.5.x store cachePassword; 0.6.x+ dropped it
+// and added telemetryEnabled. The fields rclone needs are the same in both.
 type protonCLISessionSnapshot struct {
-	CachePassword   string `json:"cachePassword"`
+	CachePassword   string `json:"cachePassword,omitempty"`
 	UserKeyPassword string `json:"userKeyPassword"`
 	Session         struct {
 		UID          string `json:"uid"`
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 	} `json:"session"`
+	TelemetryEnabled *bool `json:"telemetryEnabled,omitempty"`
 }
+
+type protonSessionFormat int
+
+const (
+	// protonSessionFormatLegacy is the CLI 0.4.x/0.5.x layout (with cachePassword).
+	protonSessionFormatLegacy protonSessionFormat = iota
+	// protonSessionFormatV2 is the CLI 0.6.x-0.9.x layout (telemetryEnabled, no cachePassword).
+	protonSessionFormatV2
+)
 
 var errProtonCLISessionNotFound = errors.New("proton CLI session secret not found")
 
@@ -76,7 +89,7 @@ type protonCLISessionStoreSnapshot struct {
 }
 
 func configureRemoteFromProtonCLISession(remote string, verify bool) error {
-	if err := validateProtonSessionBridgeVersion(false); err != nil {
+	if _, err := validateProtonSessionBridgeVersion(false); err != nil {
 		return err
 	}
 	sessionSnapshot, err := loadProtonCLISessionSnapshot()
@@ -128,7 +141,8 @@ func configureRemoteFromProtonCLISession(remote string, verify bool) error {
 }
 
 func configureProtonCLISessionFromRcloneRemote(remote string, verify bool) error {
-	if err := validateProtonSessionBridgeVersion(!verify); err != nil {
+	format, err := validateProtonSessionBridgeVersion(!verify)
+	if err != nil {
 		return err
 	}
 	snapshot, err := protonCLISessionFromRcloneRemote(remote)
@@ -139,6 +153,7 @@ func configureProtonCLISessionFromRcloneRemote(remote string, verify bool) error
 	if err != nil {
 		return fmt.Errorf("unable to snapshot the existing Proton CLI session before export: %w", err)
 	}
+	snapshot = adaptProtonCLISessionSnapshot(snapshot, format, previous)
 	target, err := writeProtonCLISessionSnapshot(snapshot)
 	if err != nil {
 		return rollbackProtonCLISessionError(previous, err)
@@ -157,34 +172,60 @@ func configureProtonCLISessionFromRcloneRemote(remote string, verify bool) error
 	return nil
 }
 
-func validateProtonSessionBridgeVersion(allowUnavailable bool) error {
+func validateProtonSessionBridgeVersion(allowUnavailable bool) (protonSessionFormat, error) {
 	if truthyEnv(os.Getenv("PROTONDRIVE_UNSAFE_SESSION_BRIDGE")) {
 		fmt.Fprintln(os.Stderr, "Warning: bypassing Proton CLI private-session compatibility check.")
-		return nil
+		return protonSessionFormatV2, nil
 	}
 	if err := ensureProtonDrive(); err != nil {
 		if allowUnavailable {
 			fmt.Fprintln(os.Stderr, "Warning: Proton CLI is unavailable; private-session compatibility could not be checked.")
-			return nil
+			return protonSessionFormatV2, nil
 		}
-		return err
+		return 0, err
 	}
 	output, err := runProtonDriveCapture("version")
 	if err != nil {
-		return fmt.Errorf("unable to verify Proton CLI session compatibility: %w", err)
+		return 0, fmt.Errorf("unable to verify Proton CLI session compatibility: %w", err)
 	}
 	return validateProtonSessionBridgeVersionOutput(output)
 }
 
-func validateProtonSessionBridgeVersionOutput(output string) error {
+// validateProtonSessionBridgeVersionOutput maps `proton-drive version` output
+// to a known private-session layout and fails closed for unknown series.
+func validateProtonSessionBridgeVersionOutput(output string) (protonSessionFormat, error) {
 	match := regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`).FindStringSubmatch(output)
 	if len(match) != 4 {
-		return fmt.Errorf("cannot recognize Proton CLI version %q; refusing to manipulate its private session format", strings.TrimSpace(output))
+		return 0, fmt.Errorf("cannot recognize Proton CLI version %q; refusing to manipulate its private session format", strings.TrimSpace(output))
 	}
-	if match[1] != "0" || (match[2] != "4" && match[2] != "5") {
-		return fmt.Errorf("proton CLI %s is outside the validated private-session bridge series 0.4.x and 0.5.x; use official browser authentication or set PROTONDRIVE_UNSAFE_SESSION_BRIDGE=true only after verifying the upstream format", match[0])
+	if match[1] == "0" {
+		switch match[2] {
+		case "4", "5":
+			return protonSessionFormatLegacy, nil
+		case "6", "7", "8", "9":
+			return protonSessionFormatV2, nil
+		}
 	}
-	return nil
+	return 0, fmt.Errorf("proton CLI %s is outside the validated private-session bridge series 0.4.x-0.9.x; use official browser authentication or set PROTONDRIVE_UNSAFE_SESSION_BRIDGE=true only after verifying the upstream format", match[0])
+}
+
+// adaptProtonCLISessionSnapshot shapes an exported session for the installed
+// CLI's layout, keeping the telemetry choice of any session it replaces.
+func adaptProtonCLISessionSnapshot(snapshot protonCLISessionSnapshot, format protonSessionFormat, previous protonCLISessionStoreSnapshot) protonCLISessionSnapshot {
+	if format == protonSessionFormatLegacy {
+		snapshot.TelemetryEnabled = nil
+		return snapshot
+	}
+	snapshot.CachePassword = ""
+	telemetry := false
+	if previous.Exists {
+		var existing protonCLISessionSnapshot
+		if err := json.Unmarshal(bytes.TrimSpace(previous.Payload), &existing); err == nil && existing.TelemetryEnabled != nil {
+			telemetry = *existing.TelemetryEnabled
+		}
+	}
+	snapshot.TelemetryEnabled = &telemetry
+	return snapshot
 }
 
 func protonCLISessionFromRcloneRemote(remote string) (protonCLISessionSnapshot, error) {
@@ -324,7 +365,7 @@ func loadProtonCLISessionFromSecretTool() ([]byte, error) {
 }
 
 func writeProtonCLISessionSnapshot(snapshot protonCLISessionSnapshot) (string, error) {
-	if strings.TrimSpace(snapshot.CachePassword) == "" ||
+	if (strings.TrimSpace(snapshot.CachePassword) == "" && snapshot.TelemetryEnabled == nil) ||
 		strings.TrimSpace(snapshot.UserKeyPassword) == "" ||
 		strings.TrimSpace(snapshot.Session.UID) == "" ||
 		strings.TrimSpace(snapshot.Session.AccessToken) == "" ||

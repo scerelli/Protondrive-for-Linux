@@ -251,7 +251,7 @@ Export an already-initialized rclone session back into Proton's official CLI sec
 protondrive --backend rclone configure --from-rclone-session
 ```
 
-The session import reads Proton's OS secret-store entry (`ch.proton.drive/drive-sdk-cli` / `auth-session`) and writes an rclone Proton Drive remote containing the SDK session fields rclone needs. It uses macOS Keychain on macOS and `secret-tool`/Secret Service on Linux. On macOS, private-session export requires Bun's Keychain API; the wrapper fails closed instead of putting session JSON in `security` process arguments. Private session bridging is version-gated to the validated Proton CLI 0.4.x/0.5.x format and fails closed for future format series. The old encrypted credential vault remains available for password-based rclone auto-refresh.
+The session import reads Proton's OS secret-store entry (`ch.proton.drive/drive-sdk-cli` / `auth-session`) and writes an rclone Proton Drive remote containing the SDK session fields rclone needs. It uses macOS Keychain on macOS and `secret-tool`/Secret Service on Linux. On macOS, private-session export requires Bun's Keychain API; the wrapper fails closed instead of putting session JSON in `security` process arguments. Private session bridging is version-gated to the validated Proton CLI 0.4.x-0.9.x formats (0.6.x+ dropped `cachePassword` and added `telemetryEnabled`; export writes the layout matching the installed CLI) and fails closed for future format series. The old encrypted credential vault remains available for password-based rclone auto-refresh.
 
 ### Browse
 
